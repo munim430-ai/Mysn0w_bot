@@ -1,0 +1,45 @@
+github:
+  repo_owner: "munim430-ai"
+  repo_name: "Mysn0w_bot"
+  data_branch: "factory-data"
+  commit_message_template: "Update: {module_name} {timestamp}"
+  pat_env_var: "GH_PAT"
+
+paths:
+  raw_data: "data/raw/"
+  processed_data: "data/processed/"
+  logs: "logs/"
+
+scraping:
+  delay_between_requests: 2
+  max_retries: 3
+  timeout: 30
+  user_agent: "Mozilla/5.0 (compatible; FactoryBot/1.0)"
+
+rsc:
+  base_url: "https://rsc-bd.org/factories/"
+  accord_cap_base: "https://accord2.fairfactories.org/web/Audits/Audits/DownloadCAPFile"
+
+brands:
+  - name: "H&M"
+    url: "https://hm.com/en_us/sustainability/sustainable-fashion/supply-transparency.html"
+  - name: "Inditex"
+    url: "https://inditex.com/en/sustainability/supply-chain"
+  - name: "C&A"
+    url: "https://c-and-a.com/sustainability/supply-chain"
+  - name: "Uniqlo"
+    url: "https://fastretailing.com/sustainability/supply-chain/"
+  - name: "Patagonia"
+    url: "https://patagonia.com/our-footprint.html"
+  - name: "Adidas"
+    url: "https://adidas-group.com/en/sustainability/compliance/supply-chain/"
+  - name: "Nike"
+    url: "https://manufacturingmap.nikeinc.com"
+  - name: "Walmart"
+    url: "https://corporate.walmart.com/global-responsibility"
+  - name: "Gap"
+    url: "https://gapinc.com/sustainability"
+
+bgmea:
+  base_url: "https://bgmea.com.bd"
+  member_list_path: "/member-directory"
