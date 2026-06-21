@@ -7,12 +7,15 @@ import csv
 import logging
 import re
 import time
+import urllib3
 from datetime import datetime
 from pathlib import Path
 
 import requests
 import yaml
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from github_uploader import GitHubUploader
 
@@ -54,7 +57,7 @@ class BGMEAScraper:
         """Fetch page with retry and anti-scraping evasion."""
         try:
             time.sleep(self.delay)
-            resp = self.session.get(url, timeout=self.timeout)
+            resp = self.session.get(url, timeout=self.timeout, verify=False)
 
             # Check for anti-scraping measures
             if resp.status_code == 403:

@@ -6,12 +6,15 @@ Handles authentication, branch management, and file commits to the factory-data 
 import os
 import base64
 import logging
+import urllib3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import requests
 import yaml
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 

@@ -6,11 +6,14 @@ Downloads CAP PDFs for each factory with resume capability.
 import csv
 import logging
 import time
+import urllib3
 from datetime import datetime
 from pathlib import Path
 
 import requests
 import yaml
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from github_uploader import GitHubUploader
 
@@ -81,7 +84,7 @@ class CAPDownloader:
         """Download a single PDF with retry and exponential backoff."""
         try:
             time.sleep(self.delay)
-            resp = self.session.get(url, timeout=self.timeout, stream=True, allow_redirects=True)
+            resp = self.session.get(url, timeout=self.timeout, stream=True, allow_redirects=True, verify=False)
 
             if resp.status_code == 404:
                 logger.warning(f"404 Not Found: {url}")
@@ -108,7 +111,7 @@ class CAPDownloader:
                     logger.warning(f"Non-PDF content from {url} (type: {content_type})")
                     return False
                 # Reset iterator
-                resp = self.session.get(url, timeout=self.timeout, stream=True)
+                resp = self.session.get(url, timeout=self.timeout, stream=True, verify=False)
                 time.sleep(self.delay)
 
             with open(filepath, "wb") as f:

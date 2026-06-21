@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+import urllib3
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -15,6 +16,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 import yaml
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from github_uploader import GitHubUploader
 
@@ -51,7 +54,7 @@ class BrandScraper:
         """Fetch page with retry logic."""
         try:
             time.sleep(self.delay)
-            resp = self.session.get(url, timeout=self.timeout)
+            resp = self.session.get(url, timeout=self.timeout, verify=False)
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as e:
@@ -222,7 +225,7 @@ class BrandScraper:
         for csv_url in potential_urls:
             try:
                 time.sleep(self.delay)
-                resp = self.session.get(csv_url, timeout=self.timeout)
+                resp = self.session.get(csv_url, timeout=self.timeout, verify=False)
                 if resp.status_code == 200 and "csv" in resp.headers.get("Content-Type", "").lower():
                     lines = resp.text.strip().split("\n")
                     reader = csv.DictReader(lines)
