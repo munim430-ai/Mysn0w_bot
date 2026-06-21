@@ -7,12 +7,16 @@ import csv
 import logging
 import re
 import time
+import urllib3
 from datetime import datetime
 from pathlib import Path
 
 import requests
 import yaml
 from bs4 import BeautifulSoup
+
+# Suppress SSL verification warnings (for environments with SSL issues)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from github_uploader import GitHubUploader
 
@@ -64,7 +68,7 @@ class RSCScraper:
         """Fetch page with retry logic."""
         try:
             time.sleep(self.delay)
-            resp = self.session.get(url, timeout=self.timeout)
+            resp = self.session.get(url, timeout=self.timeout, verify=False)
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as e:
