@@ -138,18 +138,28 @@ class RSCScraper:
             "scraped_at": datetime.now().isoformat(),
         }
 
-        # Try table cells
+        # Try table cells (RSC factory listing column order)
         cells = row.select("td")
         if len(cells) >= 2:
             factory["name"] = cells[0].get_text(strip=True)
-            factory["address"] = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-            if len(cells) > 2:
-                factory["remediation_status"] = cells[2].get_text(strip=True)
-            if len(cells) > 3:
-                progress_text = cells[3].get_text(strip=True)
+            # cols[1] = Progress %  (e.g., "91%")
+            if len(cells) > 1:
+                progress_text = cells[1].get_text(strip=True).replace("%", "")
                 progress_match = re.search(r"(\d+)", progress_text)
                 if progress_match:
                     factory["cap_progress_percent"] = progress_match.group(1)
+            # cols[2] = Status  (e.g., "Behind schedule")
+            if len(cells) > 2:
+                factory["remediation_status"] = cells[2].get_text(strip=True)
+            # cols[3] = Workers count  (e.g., "350")
+            if len(cells) > 3:
+                workers_text = cells[3].get_text(strip=True).replace(",", "")
+                workers_match = re.search(r"(\d+)", workers_text)
+                if workers_match:
+                    factory["workers_count"] = workers_match.group(1)
+            # cols[4] = Training status  (e.g., "completed")
+            if len(cells) > 4:
+                factory["safety_training_status"] = cells[4].get_text(strip=True)
 
         # Try div-based layout
         if not factory["name"]:
@@ -179,10 +189,11 @@ class RSCScraper:
         # Parse district from address
         factory["district"] = self._parse_district(factory["address"])
 
-        # Extract workers count if present
-        workers_match = re.search(r"(\d+)\s*(?:workers?|employees?)", row.get_text(), re.I)
-        if workers_match:
-            factory["workers_count"] = workers_match.group(1)
+        # Fallback: extract workers count from full row text if not set from table
+        if not factory["workers_count"]:
+            workers_match = re.search(r"(\d+)\s*(?:workers?|employees?)", row.get_text(), re.I)
+            if workers_match:
+                factory["workers_count"] = workers_match.group(1)
 
         return factory
 
