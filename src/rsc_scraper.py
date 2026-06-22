@@ -172,14 +172,24 @@ class RSCScraper:
             # Set per-page to 100 so we have fewer paginations
             try:
                 page.select_option("#perPage", "100")
-                page.wait_for_selector("#factory-data .card", timeout=15_000)
-                time.sleep(2)
             except PWTimeout:
                 logger.warning("perPage selector not found, using default page size")
 
             page_num = 1
             while True:
-                # Wait for cards to be visible
+                # Wait until #totalCount shows a real number (confirms FFC API responded)
+                try:
+                    page.wait_for_function(
+                        "() => { const el = document.getElementById('totalCount'); "
+                        "return el && /[1-9]/.test(el.innerText); }",
+                        timeout=30_000,
+                    )
+                except PWTimeout:
+                    logger.error(f"Factory data did not load on page {page_num} — "
+                                 "FFC API may be slow or site is blocking the request")
+                    break
+
+                # Then wait for the card elements themselves
                 try:
                     page.wait_for_selector("#factory-data .card", timeout=15_000)
                 except PWTimeout:

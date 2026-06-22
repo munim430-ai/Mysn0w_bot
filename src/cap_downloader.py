@@ -68,12 +68,12 @@ class CAPDownloader:
 
     def _construct_url(self, factory: dict) -> str:
         """Build CAP download URL for a factory."""
-        # Use direct URL if available
-        direct_url = factory.get("cap_download_url", "").strip()
+        # Support both old ("cap_download_url") and new ("cap_url") field names
+        direct_url = factory.get("cap_url", factory.get("cap_download_url", "")).strip()
         if direct_url and direct_url.startswith("http"):
             return direct_url
 
-        # Construct from Accord pattern
+        # Construct from Accord pattern using rsc_id
         rsc_id = factory.get("rsc_id", "").strip()
         if rsc_id:
             return f"{self.accord_base}?id={rsc_id}"
@@ -160,7 +160,11 @@ class CAPDownloader:
                 manifest_entries = list(csv.DictReader(f))
 
         for factory in factories:
-            rsc_id = factory.get("rsc_id", "").strip() or factory.get("name", "unknown").replace(" ", "_")
+            rsc_id = factory.get("rsc_id", "").strip()
+            # Support both old ("name") and new ("factory_name") scraper field names
+            factory_name = factory.get("factory_name", factory.get("name", "unknown"))
+            if not rsc_id:
+                rsc_id = factory_name.replace(" ", "_")
             filename = f"{rsc_id}.pdf"
             filepath = self.output_dir / filename
 
@@ -176,7 +180,7 @@ class CAPDownloader:
                 self.failed += 1
                 manifest_entries.append({
                     "rsc_id": rsc_id,
-                    "factory_name": factory.get("name", ""),
+                    "factory_name": factory_name,
                     "url": "",
                     "filename": filename,
                     "status": "no_url",
@@ -190,7 +194,7 @@ class CAPDownloader:
 
             entry = {
                 "rsc_id": rsc_id,
-                "factory_name": factory.get("name", ""),
+                "factory_name": factory_name,
                 "url": url,
                 "filename": filename,
                 "status": "downloaded" if success else "failed",
