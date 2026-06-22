@@ -9,8 +9,13 @@ Key logic:
 - A real PDF link  → href starts with "https://"
 - A missing report → href="javascript:void(0)"
 - boiler_missing = True  means the factory is a sales lead for boiler upgrades
+
+Compatible with both Google Colab (asyncio loop already running) and plain
+Python scripts — uses a ThreadPoolExecutor to isolate the event loop.
 """
 
+import asyncio
+import concurrent.futures
 import csv
 import logging
 import os
@@ -41,16 +46,18 @@ FIELDNAMES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# HTML parsing (pure, no Playwright dependency)
+# ---------------------------------------------------------------------------
+
 def _parse_card(card) -> dict:
     """Extract all fields from a single .card div."""
     record = {f: "" for f in FIELDNAMES}
     record["scraped_at"] = datetime.now().isoformat()
 
-    # Factory name
     h5 = card.select_one("h5.card-title")
     record["factory_name"] = h5.get_text(strip=True) if h5 else ""
 
-    # Remediation status and safety training — look for <p> with label text
     for p in card.select("p"):
         txt = p.get_text(" ", strip=True)
         strong = p.find("strong")
@@ -60,7 +67,6 @@ def _parse_card(card) -> dict:
         elif "Safety Training" in txt:
             record["safety_training"] = value
 
-    # Workers and progress — the two fw-bold <p> tags in the right column
     for p in card.select("p.fw-bold"):
         txt = p.get_text(strip=True).lstrip(": ").strip()
         if "%" in txt:
@@ -68,7 +74,6 @@ def _parse_card(card) -> dict:
         elif txt.isdigit():
             record["workers_count"] = txt
 
-    # Inspection report PDFs — 4 icons in .d-flex.flex-row
     icon_row = card.select_one("div.d-flex.flex-row.gap-2")
     if icon_row:
         for a in icon_row.select("a"):
@@ -87,22 +92,113 @@ def _parse_card(card) -> dict:
                 record["boiler_pdf_url"] = pdf_url or ""
                 record["boiler_missing"] = "True" if pdf_url is None else "False"
 
-    # CAP download link
     cap = card.find("a", string=lambda s: s and "CAP" in s)
     record["cap_url"] = cap["href"] if cap else ""
 
     return record
 
 
-def _parse_page_html(html: str) -> list[dict]:
+def _parse_page_html(html: str) -> list:
     """Parse all factory cards from a page's HTML snippet."""
     soup = BeautifulSoup(html, "lxml")
     cards = soup.select("#factory-data .card")
     return [_parse_card(c) for c in cards if c.select_one("h5.card-title")]
 
 
+# ---------------------------------------------------------------------------
+# Async scraping core
+# ---------------------------------------------------------------------------
+
+async def _scrape_async(url: str, browser_path: str | None) -> list:
+    """Load the RSC factories page and scrape all cards across all pages."""
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+    if browser_path:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browser_path
+
+    factories = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_extra_http_headers(
+            {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+
+        logger.info(f"Loading {url}")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        except PWTimeout:
+            logger.warning("Initial page load timed out — continuing anyway")
+
+        # Set per-page to 100 to reduce pagination
+        try:
+            await page.select_option("#perPage", "100")
+        except Exception:
+            logger.warning("#perPage selector not found — using default page size")
+
+        page_num = 1
+        while True:
+            # Wait until #totalCount shows a non-zero number — confirms FFC API responded
+            try:
+                await page.wait_for_function(
+                    "() => { const el = document.getElementById('totalCount');"
+                    " return el && /[1-9]/.test(el.innerText); }",
+                    timeout=30_000,
+                )
+            except PWTimeout:
+                logger.error(
+                    f"Factory data did not load on page {page_num} — "
+                    "FFC API may be slow or the site is blocking the request"
+                )
+                break
+
+            # Then wait for card elements
+            try:
+                await page.wait_for_selector("#factory-data .card", timeout=15_000)
+            except PWTimeout:
+                logger.error(f"No .card elements found on page {page_num}")
+                break
+
+            inner = await page.inner_html("#factory-data")
+            page_factories = _parse_page_html(f'<div id="factory-data">{inner}</div>')
+            factories.extend(page_factories)
+            logger.info(
+                f"Page {page_num}: {len(page_factories)} factories "
+                f"(running total: {len(factories)})"
+            )
+
+            # Check Next button
+            next_btn = await page.query_selector("button#next-btn")
+            if not next_btn:
+                logger.info("Next button not found — done")
+                break
+            disabled = await next_btn.get_attribute("disabled")
+            if disabled is not None:
+                logger.info("Last page reached")
+                break
+
+            await next_btn.click()
+            # Brief pause so the JS re-renders before we check totalCount again
+            await asyncio.sleep(2)
+            page_num += 1
+
+            if page_num > 200:
+                logger.warning("Hit 200-page safety cap")
+                break
+
+        await browser.close()
+
+    logger.info(f"Scraping complete: {len(factories)} factories across {page_num} page(s)")
+    return factories
+
+
+# ---------------------------------------------------------------------------
+# Module class
+# ---------------------------------------------------------------------------
+
 class RSCScraper:
-    """Scrapes the RSC Bangladesh factory list via Playwright."""
+    """Scrapes the RSC Bangladesh factory list via Playwright (async)."""
 
     URL = "https://rsc-bd.org/factories/"
 
@@ -115,14 +211,18 @@ class RSCScraper:
         self.output_file = self.output_dir / "rsc_factories.csv"
         self.leads_file = self.output_dir / "boiler_leads.csv"
 
-    def run(self, uploader: "GitHubUploader | None" = None) -> dict:
-        # Use pre-installed browsers if present (Claude Code remote env).
-        # In Colab or local installs, let Playwright use its default path.
+    def _resolve_browser_path(self) -> str | None:
+        """Return PLAYWRIGHT_BROWSERS_PATH only when the pre-installed dir exists."""
         preinstalled = "/opt/pw-browsers"
-        if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ and os.path.isdir(preinstalled):
-            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = preinstalled
+        if "PLAYWRIGHT_BROWSERS_PATH" in os.environ:
+            return os.environ["PLAYWRIGHT_BROWSERS_PATH"]
+        if os.path.isdir(preinstalled):
+            return preinstalled
+        return None
 
-        factories = self._scrape_with_playwright()
+    def run(self, uploader: "GitHubUploader | None" = None) -> dict:
+        browser_path = self._resolve_browser_path()
+        factories = self._run_async(_scrape_async(self.URL, browser_path))
 
         stats = {
             "module": "rsc_scraper",
@@ -137,11 +237,11 @@ class RSCScraper:
             logger.warning("No factories scraped — check site availability")
             return stats
 
-        self._write_csv(self.output_file, factories, FIELDNAMES)
+        _write_csv(self.output_file, factories, FIELDNAMES)
         logger.info(f"Saved {len(factories)} factories → {self.output_file}")
 
         leads = [f for f in factories if f.get("boiler_missing") == "True"]
-        self._write_csv(self.leads_file, leads, FIELDNAMES)
+        _write_csv(self.leads_file, leads, FIELDNAMES)
         logger.info(f"Saved {len(leads)} boiler leads → {self.leads_file}")
 
         stats["output_file"] = str(self.output_file)
@@ -153,87 +253,37 @@ class RSCScraper:
 
         return stats
 
-    def _scrape_with_playwright(self) -> list[dict]:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-        factories = []
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (compatible; RSCBot/1.0)"})
-
-            logger.info(f"Loading {self.URL}")
-            try:
-                page.goto(self.URL, wait_until="networkidle", timeout=60_000)
-            except PWTimeout:
-                logger.warning("Page load timed out, continuing with partial load")
-
-            # Set per-page to 100 so we have fewer paginations
-            try:
-                page.select_option("#perPage", "100")
-            except PWTimeout:
-                logger.warning("perPage selector not found, using default page size")
-
-            page_num = 1
-            while True:
-                # Wait until #totalCount shows a real number (confirms FFC API responded)
-                try:
-                    page.wait_for_function(
-                        "() => { const el = document.getElementById('totalCount'); "
-                        "return el && /[1-9]/.test(el.innerText); }",
-                        timeout=30_000,
-                    )
-                except PWTimeout:
-                    logger.error(f"Factory data did not load on page {page_num} — "
-                                 "FFC API may be slow or site is blocking the request")
-                    break
-
-                # Then wait for the card elements themselves
-                try:
-                    page.wait_for_selector("#factory-data .card", timeout=15_000)
-                except PWTimeout:
-                    logger.error(f"Cards not found on page {page_num}")
-                    break
-
-                html = page.inner_html("#factory-data")
-                # Wrap in the container ID so selectors work
-                page_factories = _parse_page_html(f'<div id="factory-data">{html}</div>')
-                factories.extend(page_factories)
-                logger.info(f"Page {page_num}: scraped {len(page_factories)} factories (total so far: {len(factories)})")
-
-                # Check if Next button is enabled
-                next_btn = page.query_selector("button#next-btn")
-                if not next_btn:
-                    logger.info("No next button found — done")
-                    break
-
-                is_disabled = next_btn.get_attribute("disabled")
-                if is_disabled is not None:
-                    logger.info("Next button disabled — reached last page")
-                    break
-
-                next_btn.click()
-                time.sleep(2)  # wait for JS to render new page
-                page_num += 1
-
-                # Safety cap
-                if page_num > 200:
-                    logger.warning("Hit 200-page safety cap")
-                    break
-
-            browser.close()
-
-        logger.info(f"Scraping complete: {len(factories)} factories across {page_num} pages")
-        return factories
-
     @staticmethod
-    def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+    def _run_async(coro):
+        """
+        Run an async coroutine safely regardless of whether an event loop is
+        already running (Google Colab / Jupyter) or not (plain Python script).
 
+        Strategy: always spin up a fresh event loop in a background thread so
+        we never conflict with an existing loop.
+        """
+        def _thread_target():
+            return asyncio.run(coro)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_thread_target)
+            return future.result()
+
+
+# ---------------------------------------------------------------------------
+# CSV helper
+# ---------------------------------------------------------------------------
+
+def _write_csv(path: Path, rows: list, fieldnames: list):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
