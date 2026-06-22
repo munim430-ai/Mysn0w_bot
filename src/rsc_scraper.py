@@ -116,8 +116,11 @@ class RSCScraper:
         self.leads_file = self.output_dir / "boiler_leads.csv"
 
     def run(self, uploader: "GitHubUploader | None" = None) -> dict:
-        if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
-            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/pw-browsers"
+        # Use pre-installed browsers if present (Claude Code remote env).
+        # In Colab or local installs, let Playwright use its default path.
+        preinstalled = "/opt/pw-browsers"
+        if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ and os.path.isdir(preinstalled):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = preinstalled
 
         factories = self._scrape_with_playwright()
 

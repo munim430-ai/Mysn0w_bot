@@ -16,6 +16,14 @@ echo "Installing Python dependencies..."
 pip install -r requirements.txt
 
 # Install Playwright browsers
+# On Google Colab (and other Debian/Ubuntu systems) the headless Chrome
+# dependencies may not be present — install them first if apt is available.
+if command -v apt-get &>/dev/null && [ ! -d /opt/pw-browsers ]; then
+    echo "Installing Chromium system dependencies..."
+    apt-get install -y -q libgbm1 libxkbcommon0 libxss1 libasound2 \
+        libatk-bridge2.0-0 libgtk-3-0 libx11-xcb1 2>/dev/null || true
+fi
+
 echo "Installing Playwright Chromium browser..."
 playwright install chromium
 
