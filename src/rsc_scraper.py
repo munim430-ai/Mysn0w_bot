@@ -5,6 +5,7 @@ Scrapes https://rsc-bd.org/factories/ with pagination support.
 
 import csv
 import logging
+import os
 import re
 import time
 import urllib3
@@ -266,6 +267,8 @@ class RSCScraper:
 
     def _scrape_with_playwright(self) -> list:
         """Fallback: Use Playwright for JS-rendered content."""
+        if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/pw-browsers"
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
