@@ -232,6 +232,48 @@ class AppExporter:
         logger.info(f"Exported competitors template to {output_file}")
         return output_file
 
+    def _export_boiler_leads(self, df: pd.DataFrame) -> Path:
+        """
+        Export a clean boiler_sales_leads.csv — factories where boiler_missing=True,
+        sorted by priority score descending. This is the primary deliverable.
+        """
+        output_file = self.output_dir / "boiler_sales_leads.csv"
+
+        # Support both merged (master) and direct RSC scraper output column names
+        name_col = "name" if "name" in df.columns else "factory_name"
+        workers_col = "workers_count"
+        status_col = "remediation_status"
+        progress_col = "cap_progress_percent" if "cap_progress_percent" in df.columns else "progress_rate_pct"
+
+        leads = df[df["boiler_missing"].astype(str).str.lower() == "true"].copy()
+        if "priority_score" in leads.columns:
+            leads = leads.sort_values("priority_score", ascending=False)
+
+        records = []
+        for idx, row in leads.iterrows():
+            records.append({
+                "rank": len(records) + 1,
+                "factory_name": row.get(name_col, ""),
+                "workers_count": row.get(workers_col, ""),
+                "remediation_status": row.get(status_col, ""),
+                "cap_progress_pct": row.get(progress_col, ""),
+                "priority_score": row.get("priority_score", ""),
+                "priority_color": row.get("priority_color", ""),
+                "priority_reason": row.get("priority_reason", ""),
+                "fire_pdf_url": row.get("fire_pdf_url", ""),
+                "structural_pdf_url": row.get("structural_pdf_url", ""),
+                "electrical_pdf_url": row.get("electrical_pdf_url", ""),
+                "boiler_pdf_url": "",
+                "cap_url": row.get("cap_url", ""),
+                "safety_training": row.get("safety_training", ""),
+                "scraped_at": row.get("scraped_at", ""),
+            })
+
+        out_df = pd.DataFrame(records)
+        out_df.to_csv(output_file, index=False, encoding="utf-8")
+        logger.info(f"Exported {len(records)} boiler leads → {output_file}")
+        return output_file
+
     def run(self, uploader: GitHubUploader = None) -> dict:
         """Execute the export process."""
         logger.info("Starting app exporter")
@@ -240,24 +282,31 @@ class AppExporter:
         findings_df = self._load_findings()
 
         if scored_df.empty:
-            logger.error("No scored data to export")
-            return self._get_stats()
+            # Fall back to raw rsc_factories.csv when scorer hasn't run yet
+            raw_file = Path(self.config["paths"]["raw_data"]) / "rsc_factories.csv"
+            if raw_file.exists():
+                logger.info(f"No scored DB — exporting directly from {raw_file}")
+                scored_df = pd.read_csv(raw_file, encoding="utf-8")
+            else:
+                logger.error("No scored data to export")
+                return self._get_stats()
 
-        # Export all files
-        factories_file = self._export_factories(scored_df)
-        findings_file = self._export_findings(findings_df, pd.read_csv(factories_file, encoding="utf-8"))
-        boilers_file = self._export_boilers_template()
-        interactions_file = self._export_interactions_template()
-        competitors_file = self._export_competitors_template()
+        # Always export boiler leads — the primary deliverable
+        leads_file = self._export_boiler_leads(scored_df)
+        self.exported_files = [leads_file]
 
-        self.exported_files = [
-            factories_file, findings_file, boilers_file,
-            interactions_file, competitors_file,
-        ]
+        # Full export only when master/scored data is available
+        if "priority_score" in scored_df.columns or "rsc_id" in scored_df.columns:
+            factories_file = self._export_factories(scored_df)
+            findings_file = self._export_findings(findings_df, pd.read_csv(factories_file, encoding="utf-8"))
+            boilers_file = self._export_boilers_template()
+            interactions_file = self._export_interactions_template()
+            competitors_file = self._export_competitors_template()
+            self.exported_files += [factories_file, findings_file, boilers_file,
+                                     interactions_file, competitors_file]
 
         logger.info(f"Exported {len(self.exported_files)} files to {self.output_dir}")
 
-        # Upload to GitHub
         if uploader:
             uploader.upload_directory(
                 str(self.output_dir),

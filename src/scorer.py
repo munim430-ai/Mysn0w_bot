@@ -25,6 +25,7 @@ SCORING_RULES = {
     "status_ineligible": {"points": 40, "reason": "RSC status: Ineligible - compliance gap"},
     "status_behind": {"points": 20, "reason": "RSC status: Behind schedule"},
     "boiler_present": {"points": 30, "reason": "Boiler finding present - direct equipment need"},
+    "boiler_missing_direct": {"points": 35, "reason": "No boiler safety PDF on RSC - likely needs upgrade"},
     "boiler_missing": {"points": 15, "reason": "Boiler findings MISSING from CAP - hidden risk"},
     "boiler_age_15plus": {"points": 30, "reason": "Boiler age >15 years - replacement window"},
     "boiler_age_8to15": {"points": 15, "reason": "Boiler age 8-15 years - approaching replacement"},
@@ -53,12 +54,22 @@ class PriorityScorer:
         self.scored_count = 0
 
     def _load_master(self) -> pd.DataFrame:
-        """Load master database."""
+        """Load master database, falling back to raw RSC data if not merged yet."""
         master_file = self.processed_dir / "master_database.csv"
-        if not master_file.exists():
-            logger.error(f"Master database not found: {master_file}")
-            return pd.DataFrame()
-        return pd.read_csv(master_file, encoding="utf-8")
+        if master_file.exists():
+            return pd.read_csv(master_file, encoding="utf-8")
+
+        # Fallback: score directly from rsc_factories.csv
+        rsc_file = Path(self.config["paths"]["raw_data"]) / "rsc_factories.csv"
+        if rsc_file.exists():
+            logger.info(f"No master database — using RSC factories directly: {rsc_file}")
+            df = pd.read_csv(rsc_file, encoding="utf-8")
+            # Normalise field names to match the scorer's expectations
+            df = df.rename(columns={"factory_name": "name", "progress_rate_pct": "cap_progress_percent"})
+            return df
+
+        logger.error("Master database not found: %s", master_file)
+        return pd.DataFrame()
 
     def _load_findings(self) -> pd.DataFrame:
         """Load parsed findings."""
@@ -122,6 +133,12 @@ class PriorityScorer:
         # Count findings by priority for this factory
         factory_findings = findings_df[findings_df["factory_id"] == factory_id] if not findings_df.empty else pd.DataFrame()
 
+        # Direct boiler_missing flag from RSC scraper (highest-confidence signal)
+        boiler_missing_flag = str(row.get("boiler_missing", "")).lower()
+        if boiler_missing_flag == "true":
+            score += SCORING_RULES["boiler_missing_direct"]["points"]
+            reasons.append(SCORING_RULES["boiler_missing_direct"]["reason"])
+
         if not factory_findings.empty:
             p1_count = len(factory_findings[factory_findings["priority"].str.upper() == "P1"])
             p2_count = len(factory_findings[factory_findings["priority"].str.upper() == "P2"])
@@ -143,21 +160,20 @@ class PriorityScorer:
             if len(boiler_findings) > 0:
                 score += SCORING_RULES["boiler_present"]["points"]
                 reasons.append(SCORING_RULES["boiler_present"]["reason"])
-        else:
-            # No findings parsed - check if boiler findings are missing from CAP
-            # This is flagged during parsing
+        elif boiler_missing_flag != "true":
+            # No findings parsed and no direct flag — treat as hidden risk
             score += SCORING_RULES["boiler_missing"]["points"]
             reasons.append(SCORING_RULES["boiler_missing"]["reason"])
 
-        # RSC status
+        # RSC status — use substring match; real values are "Behind schedule", etc.
         status = str(row.get("remediation_status", "")).strip().lower()
-        if status == "terminated":
+        if "terminated" in status:
             score += SCORING_RULES["status_terminated"]["points"]
             reasons.append(SCORING_RULES["status_terminated"]["reason"])
-        elif status == "ineligible":
+        elif "ineligible" in status:
             score += SCORING_RULES["status_ineligible"]["points"]
             reasons.append(SCORING_RULES["status_ineligible"]["reason"])
-        elif status == "behind":
+        elif "behind" in status:
             score += SCORING_RULES["status_behind"]["points"]
             reasons.append(SCORING_RULES["status_behind"]["reason"])
 

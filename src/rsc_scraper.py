@@ -1,355 +1,225 @@
 """
 Module 1: RSC Factory List Scraper
-Scrapes https://rsc-bd.org/factories/ with pagination support.
+
+Scrapes https://rsc-bd.org/factories/ — a JS-rendered WordPress page that
+loads factory cards into #factory-data via the FFC API.
+
+Key logic:
+- Each factory card has 4 inspection-report icons: Fire, Structural, Electrical, Boiler
+- A real PDF link  → href starts with "https://"
+- A missing report → href="javascript:void(0)"
+- boiler_missing = True  means the factory is a sales lead for boiler upgrades
 """
 
 import csv
 import logging
 import os
-import re
 import time
-import urllib3
 from datetime import datetime
 from pathlib import Path
 
-import requests
 import yaml
 from bs4 import BeautifulSoup
-
-# Suppress SSL verification warnings (for environments with SSL issues)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from github_uploader import GitHubUploader
 
 logger = logging.getLogger(__name__)
 
-# Common Bangladesh districts for parsing
-DISTRICTS = [
-    "Dhaka", "Gazipur", "Narayanganj", "Chittagong", "Khulna",
-    "Rajshahi", "Sylhet", "Barisal", "Rangpur", "Mymensingh",
-    "Comilla", "Tangail", "Kushtia", "Jessore", "Dinajpur",
-    "Faridpur", "Bogra", "Pabna", "Rangamati", "Bandarban",
-    "Narsingdi", "Manikganj", "Munshiganj", "Gopalganj",
-    "Shariatpur", "Madaripur", "Rajbari", "Kishoreganj",
-    "Netrokona", "Jamalpur", "Sherpur", "Naogaon", "Natore",
-    "Nawabganj", "Sirajganj", "Joypurhat", "Gaibandha",
-    "Kurigram", "Lalmonirhat", "Nilphamari", "Panchagarh",
-    "Thakurgaon", "Habiganj", "Moulvibazar", "Sunamganj",
-    "Brahmanbaria", "Chandpur", "Feni", "Khagrachhari",
-    "Lakshmipur", "Noakhali", "Bagerhat", "Chuadanga",
-    "Jhenaidah", "Magura", "Meherpur", "Narail", "Satkhira",
+FIELDNAMES = [
+    "factory_name",
+    "remediation_status",
+    "safety_training",
+    "workers_count",
+    "progress_rate_pct",
+    "fire_pdf_url",
+    "structural_pdf_url",
+    "electrical_pdf_url",
+    "boiler_pdf_url",
+    "boiler_missing",
+    "cap_url",
+    "scraped_at",
 ]
 
 
+def _parse_card(card) -> dict:
+    """Extract all fields from a single .card div."""
+    record = {f: "" for f in FIELDNAMES}
+    record["scraped_at"] = datetime.now().isoformat()
+
+    # Factory name
+    h5 = card.select_one("h5.card-title")
+    record["factory_name"] = h5.get_text(strip=True) if h5 else ""
+
+    # Remediation status and safety training — look for <p> with label text
+    for p in card.select("p"):
+        txt = p.get_text(" ", strip=True)
+        strong = p.find("strong")
+        value = strong.get_text(strip=True) if strong else ""
+        if "Remediation Status" in txt:
+            record["remediation_status"] = value
+        elif "Safety Training" in txt:
+            record["safety_training"] = value
+
+    # Workers and progress — the two fw-bold <p> tags in the right column
+    for p in card.select("p.fw-bold"):
+        txt = p.get_text(strip=True).lstrip(": ").strip()
+        if "%" in txt:
+            record["progress_rate_pct"] = txt.replace("%", "").strip()
+        elif txt.isdigit():
+            record["workers_count"] = txt
+
+    # Inspection report PDFs — 4 icons in .d-flex.flex-row
+    icon_row = card.select_one("div.d-flex.flex-row.gap-2")
+    if icon_row:
+        for a in icon_row.select("a"):
+            href = a.get("href", "")
+            img = a.find("img")
+            title = img.get("title", "") if img else ""
+            pdf_url = href if href.startswith("http") else None
+
+            if "Fire" in title:
+                record["fire_pdf_url"] = pdf_url or ""
+            elif "Structural" in title:
+                record["structural_pdf_url"] = pdf_url or ""
+            elif "Electrical" in title:
+                record["electrical_pdf_url"] = pdf_url or ""
+            elif "Boiler" in title:
+                record["boiler_pdf_url"] = pdf_url or ""
+                record["boiler_missing"] = "True" if pdf_url is None else "False"
+
+    # CAP download link
+    cap = card.find("a", string=lambda s: s and "CAP" in s)
+    record["cap_url"] = cap["href"] if cap else ""
+
+    return record
+
+
+def _parse_page_html(html: str) -> list[dict]:
+    """Parse all factory cards from a page's HTML snippet."""
+    soup = BeautifulSoup(html, "lxml")
+    cards = soup.select("#factory-data .card")
+    return [_parse_card(c) for c in cards if c.select_one("h5.card-title")]
+
+
 class RSCScraper:
-    """Scrapes the RSC Bangladesh factory list."""
+    """Scrapes the RSC Bangladesh factory list via Playwright."""
+
+    URL = "https://rsc-bd.org/factories/"
 
     def __init__(self, config_path: str = "config.yaml"):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
-        self.base_url = self.config["rsc"]["base_url"]
         self.output_dir = Path(self.config["paths"]["raw_data"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.output_file = self.output_dir / "rsc_factories.csv"
+        self.leads_file = self.output_dir / "boiler_leads.csv"
 
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": self.config["scraping"]["user_agent"],
-        })
-        self.delay = self.config["scraping"]["delay_between_requests"]
-        self.max_retries = self.config["scraping"]["max_retries"]
-        self.timeout = self.config["scraping"]["timeout"]
-
-        self.success_count = 0
-        self.failure_count = 0
-        self.errors = []
-
-    def _fetch_page(self, url: str, retries: int = 0) -> str:
-        """Fetch page with retry logic."""
-        try:
-            time.sleep(self.delay)
-            resp = self.session.get(url, timeout=self.timeout, verify=False)
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as e:
-            if retries < self.max_retries:
-                wait = 2 ** retries
-                logger.warning(f"Retry {retries+1}/{self.max_retries} for {url} after {wait}s: {e}")
-                time.sleep(wait)
-                return self._fetch_page(url, retries + 1)
-            self.errors.append(f"Failed to fetch {url}: {e}")
-            logger.error(f"Max retries exceeded for {url}: {e}")
-            return ""
-
-    def _parse_district(self, address: str) -> str:
-        """Extract district from address string."""
-        if not address:
-            return ""
-        for district in DISTRICTS:
-            if district.lower() in address.lower():
-                return district
-        # Try regex for "District: XXX" pattern
-        match = re.search(r"[Dd]istrict[:\s]+([A-Za-z]+)", address)
-        if match:
-            return match.group(1)
-        return ""
-
-    def _extract_factories_from_html(self, html: str) -> list:
-        """Parse factory data from HTML."""
-        factories = []
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Try multiple selector patterns
-        rows = soup.select("table tbody tr")
-        if not rows:
-            rows = soup.select(".factory-row, .factory-item, [data-factory]")
-        if not rows:
-            # Generic fallback - look for structured divs
-            rows = soup.select("div[class*='factory'], div[class*='item']")
-
-        logger.info(f"Found {len(rows)} potential factory rows")
-
-        for row in rows:
-            try:
-                factory = self._parse_factory_row(row)
-                if factory and factory.get("name"):
-                    factories.append(factory)
-                    self.success_count += 1
-                else:
-                    self.failure_count += 1
-            except Exception as e:
-                self.failure_count += 1
-                self.errors.append(f"Parse error: {e}")
-
-        return factories
-
-    def _parse_factory_row(self, row) -> dict:
-        """Parse a single factory row/element."""
-        factory = {
-            "rsc_id": "",
-            "name": "",
-            "address": "",
-            "district": "",
-            "remediation_status": "",
-            "cap_progress_percent": "",
-            "safety_training_status": "",
-            "cap_download_url": "",
-            "workers_count": "",
-            "scraped_at": datetime.now().isoformat(),
-        }
-
-        # Try table cells (RSC factory listing column order)
-        cells = row.select("td")
-        if len(cells) >= 2:
-            factory["name"] = cells[0].get_text(strip=True)
-            # cols[1] = Progress %  (e.g., "91%")
-            if len(cells) > 1:
-                progress_text = cells[1].get_text(strip=True).replace("%", "")
-                progress_match = re.search(r"(\d+)", progress_text)
-                if progress_match:
-                    factory["cap_progress_percent"] = progress_match.group(1)
-            # cols[2] = Status  (e.g., "Behind schedule")
-            if len(cells) > 2:
-                factory["remediation_status"] = cells[2].get_text(strip=True)
-            # cols[3] = Workers count  (e.g., "350")
-            if len(cells) > 3:
-                workers_text = cells[3].get_text(strip=True).replace(",", "")
-                workers_match = re.search(r"(\d+)", workers_text)
-                if workers_match:
-                    factory["workers_count"] = workers_match.group(1)
-            # cols[4] = Training status  (e.g., "completed")
-            if len(cells) > 4:
-                factory["safety_training_status"] = cells[4].get_text(strip=True)
-
-        # Try div-based layout
-        if not factory["name"]:
-            name_el = row.select_one(".factory-name, .name, h3, h4, .title")
-            if name_el:
-                factory["name"] = name_el.get_text(strip=True)
-
-            addr_el = row.select_one(".address, .location, [class*='address']")
-            if addr_el:
-                factory["address"] = addr_el.get_text(strip=True)
-
-            status_el = row.select_one(".status, .remediation, [class*='status']")
-            if status_el:
-                factory["remediation_status"] = status_el.get_text(strip=True)
-
-        # Look for links
-        for link in row.find_all("a", href=True):
-            href = link["href"]
-            if "cap" in href.lower() or "download" in href.lower():
-                factory["cap_download_url"] = href if href.startswith("http") else f"https://rsc-bd.org{href}"
-            if href.startswith("http") and "rsc-bd.org" in href:
-                # Extract ID from URL
-                id_match = re.search(r"/(\d+)/?$", href)
-                if id_match and not factory["rsc_id"]:
-                    factory["rsc_id"] = id_match.group(1)
-
-        # Parse district from address
-        factory["district"] = self._parse_district(factory["address"])
-
-        # Fallback: extract workers count from full row text if not set from table
-        if not factory["workers_count"]:
-            workers_match = re.search(r"(\d+)\s*(?:workers?|employees?)", row.get_text(), re.I)
-            if workers_match:
-                factory["workers_count"] = workers_match.group(1)
-
-        return factory
-
-    def _detect_pagination(self, html: str) -> list:
-        """Detect pagination and return list of page URLs."""
-        soup = BeautifulSoup(html, "html.parser")
-        pages = [self.base_url]
-
-        # Look for pagination links
-        pagination = soup.select(".pagination a, .page-link, [class*='page']")
-        seen = set()
-
-        for link in pagination:
-            href = link.get("href", "")
-            if href and href not in seen:
-                seen.add(href)
-                full_url = href if href.startswith("http") else f"https://rsc-bd.org{href}"
-                if full_url not in pages:
-                    pages.append(full_url)
-
-        # Check for infinite scroll / JS-rendered content
-        if not pagination and "load more" in html.lower():
-            logger.info("Possible infinite scroll detected - consider using Playwright")
-
-        return pages
-
-    def run(self, uploader: GitHubUploader = None) -> dict:
-        """Execute the scraper and return statistics."""
-        logger.info(f"Starting RSC scraper: {self.base_url}")
-
-        # Fetch main page
-        html = self._fetch_page(self.base_url)
-        if not html:
-            return self._get_stats()
-
-        # Detect pagination
-        page_urls = self._detect_pagination(html)
-        logger.info(f"Detected {len(page_urls)} page(s) to scrape")
-
-        all_factories = []
-        for url in page_urls:
-            if url != self.base_url:
-                html = self._fetch_page(url)
-            if html:
-                factories = self._extract_factories_from_html(html)
-                all_factories.extend(factories)
-                logger.info(f"Extracted {len(factories)} factories from {url}")
-
-        # Handle JS-rendered sites with Playwright fallback
-        if not all_factories:
-            logger.info("No factories found with static parsing, trying Playwright...")
-            all_factories = self._scrape_with_playwright()
-
-        # Write CSV
-        if all_factories:
-            self._write_csv(all_factories)
-            logger.info(f"Saved {len(all_factories)} factories to {self.output_file}")
-
-            # Upload to GitHub
-            if uploader:
-                uploader.upload_file(
-                    str(self.output_file),
-                    "data/raw/rsc_factories.csv",
-                    "rsc_scraper",
-                )
-        else:
-            logger.warning("No factories extracted - site structure may have changed")
-
-        return self._get_stats()
-
-    def _scrape_with_playwright(self) -> list:
-        """Fallback: Use Playwright for JS-rendered content."""
+    def run(self, uploader: "GitHubUploader | None" = None) -> dict:
         if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/pw-browsers"
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            logger.error("Playwright not installed, cannot handle JS-rendered content")
-            return []
+
+        factories = self._scrape_with_playwright()
+
+        stats = {
+            "module": "rsc_scraper",
+            "total": len(factories),
+            "boiler_missing": sum(1 for f in factories if f.get("boiler_missing") == "True"),
+            "boiler_present": sum(1 for f in factories if f.get("boiler_missing") == "False"),
+            "output_file": None,
+            "leads_file": None,
+        }
+
+        if not factories:
+            logger.warning("No factories scraped — check site availability")
+            return stats
+
+        self._write_csv(self.output_file, factories, FIELDNAMES)
+        logger.info(f"Saved {len(factories)} factories → {self.output_file}")
+
+        leads = [f for f in factories if f.get("boiler_missing") == "True"]
+        self._write_csv(self.leads_file, leads, FIELDNAMES)
+        logger.info(f"Saved {len(leads)} boiler leads → {self.leads_file}")
+
+        stats["output_file"] = str(self.output_file)
+        stats["leads_file"] = str(self.leads_file)
+
+        if uploader:
+            uploader.upload_file(str(self.output_file), "data/raw/rsc_factories.csv", "rsc_scraper")
+            uploader.upload_file(str(self.leads_file), "data/raw/boiler_leads.csv", "rsc_scraper")
+
+        return stats
+
+    def _scrape_with_playwright(self) -> list[dict]:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
         factories = []
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.set_extra_http_headers({
-                    "User-Agent": self.config["scraping"]["user_agent"],
-                })
 
-                logger.info(f"Navigating with Playwright: {self.base_url}")
-                page.goto(self.base_url, wait_until="networkidle", timeout=30000)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (compatible; RSCBot/1.0)"})
 
-                # Handle infinite scroll
-                last_height = page.evaluate("document.body.scrollHeight")
-                scroll_attempts = 0
-                max_scrolls = 50
+            logger.info(f"Loading {self.URL}")
+            try:
+                page.goto(self.URL, wait_until="networkidle", timeout=60_000)
+            except PWTimeout:
+                logger.warning("Page load timed out, continuing with partial load")
 
-                while scroll_attempts < max_scrolls:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    time.sleep(2)
-                    new_height = page.evaluate("document.body.scrollHeight")
-                    if new_height == last_height:
-                        break
-                    last_height = new_height
-                    scroll_attempts += 1
+            # Set per-page to 100 so we have fewer paginations
+            try:
+                page.select_option("#perPage", "100")
+                page.wait_for_selector("#factory-data .card", timeout=15_000)
+                time.sleep(2)
+            except PWTimeout:
+                logger.warning("perPage selector not found, using default page size")
 
-                # Also check for "Load More" buttons
-                for _ in range(20):
-                    try:
-                        load_more = page.locator("text=Load More, text=Show More, text=View More").first
-                        if load_more.is_visible():
-                            load_more.click()
-                            time.sleep(2)
-                        else:
-                            break
-                    except:
-                        break
+            page_num = 1
+            while True:
+                # Wait for cards to be visible
+                try:
+                    page.wait_for_selector("#factory-data .card", timeout=15_000)
+                except PWTimeout:
+                    logger.error(f"Cards not found on page {page_num}")
+                    break
 
-                html = page.content()
-                browser.close()
+                html = page.inner_html("#factory-data")
+                # Wrap in the container ID so selectors work
+                page_factories = _parse_page_html(f'<div id="factory-data">{html}</div>')
+                factories.extend(page_factories)
+                logger.info(f"Page {page_num}: scraped {len(page_factories)} factories (total so far: {len(factories)})")
 
-                factories = self._extract_factories_from_html(html)
-                logger.info(f"Playwright extracted {len(factories)} factories")
+                # Check if Next button is enabled
+                next_btn = page.query_selector("button#next-btn")
+                if not next_btn:
+                    logger.info("No next button found — done")
+                    break
 
-        except Exception as e:
-            logger.error(f"Playwright error: {e}")
-            self.errors.append(f"Playwright: {e}")
+                is_disabled = next_btn.get_attribute("disabled")
+                if is_disabled is not None:
+                    logger.info("Next button disabled — reached last page")
+                    break
 
+                next_btn.click()
+                time.sleep(2)  # wait for JS to render new page
+                page_num += 1
+
+                # Safety cap
+                if page_num > 200:
+                    logger.warning("Hit 200-page safety cap")
+                    break
+
+            browser.close()
+
+        logger.info(f"Scraping complete: {len(factories)} factories across {page_num} pages")
         return factories
 
-    def _write_csv(self, factories: list):
-        """Write factories to CSV."""
-        if not factories:
-            return
-        fieldnames = [
-            "rsc_id", "name", "address", "district", "remediation_status",
-            "cap_progress_percent", "safety_training_status", "cap_download_url",
-            "workers_count", "scraped_at",
-        ]
-        with open(self.output_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+    @staticmethod
+    def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
-            for factory in factories:
-                row = {k: factory.get(k, "") for k in fieldnames}
-                writer.writerow(row)
-
-    def _get_stats(self) -> dict:
-        """Return scrape statistics."""
-        return {
-            "module": "rsc_scraper",
-            "success": self.success_count,
-            "failed": self.failure_count,
-            "errors": self.errors[:10],  # Limit errors
-            "output_file": str(self.output_file) if self.output_file.exists() else None,
-        }
+            writer.writerows(rows)
 
 
 if __name__ == "__main__":
