@@ -168,7 +168,9 @@ class DataMerger:
         if not rsc_df.empty:
             base_df = rsc_df.copy()
             base_df["_source"] = "rsc"
-            base_df["_norm_name"] = base_df["name"].apply(self._normalize_name)
+            # Support both old field name ("name") and new scraper field name ("factory_name")
+            name_col = "name" if "name" in base_df.columns else "factory_name"
+            base_df["_norm_name"] = base_df[name_col].apply(self._normalize_name)
         elif not brand_df.empty:
             base_df = brand_df.copy()
             base_df["_source"] = "brand"
@@ -189,10 +191,22 @@ class DataMerger:
                 "address": base_row.get("address", ""),
                 "district": base_row.get("district", ""),
                 "remediation_status": base_row.get("remediation_status", ""),
-                "cap_progress_percent": base_row.get("cap_progress_percent", ""),
-                "safety_training_status": base_row.get("safety_training_status", ""),
-                "cap_download_url": base_row.get("cap_download_url", ""),
+                # Support both old (cap_progress_percent) and new (progress_rate_pct) field names
+                "cap_progress_percent": base_row.get("cap_progress_percent",
+                                                     base_row.get("progress_rate_pct", "")),
+                # Support both old (safety_training_status) and new (safety_training) field names
+                "safety_training_status": base_row.get("safety_training_status",
+                                                       base_row.get("safety_training", "")),
+                # Support both old (cap_download_url) and new (cap_url) field names
+                "cap_download_url": base_row.get("cap_download_url",
+                                                 base_row.get("cap_url", "")),
                 "workers_count": base_row.get("workers_count", ""),
+                # Boiler lead fields — carry through from new RSC scraper
+                "boiler_missing": base_row.get("boiler_missing", ""),
+                "fire_pdf_url": base_row.get("fire_pdf_url", ""),
+                "structural_pdf_url": base_row.get("structural_pdf_url", ""),
+                "electrical_pdf_url": base_row.get("electrical_pdf_url", ""),
+                "boiler_pdf_url": base_row.get("boiler_pdf_url", ""),
                 "phone": "",
                 "email": "",
                 "website": "",
